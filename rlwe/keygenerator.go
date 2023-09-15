@@ -15,7 +15,11 @@ type KeyGenerator interface {
 	GenPublicKey(sk *SecretKey) (pk *PublicKey)
 	GenKeyPair() (sk *SecretKey, pk *PublicKey)
 	GenRelinearizationKey(sk *SecretKey, maxDegree int) (evk *RelinearizationKey)
+
 	GenSwitchingKey(skInput, skOutput *SecretKey) (newevakey *SwitchingKey)
+
+	GenSwitchingKeyExplicit(skInput *SecretKey,pkOutput *PublicKey, swk *SwitchingKey) (newevakey *SwitchingKey)
+
 	GenSwitchingKeyForGalois(galEl uint64, sk *SecretKey) (swk *SwitchingKey)
 	GenRotationKeys(galEls []uint64, sk *SecretKey) (rks *RotationKeySet)
 	GenSwitchingKeyForRotationBy(k int, sk *SecretKey) (swk *SwitchingKey)
@@ -280,6 +284,86 @@ func (keygen *keyGenerator) GenSwitchingKey(skInput, skOutput *SecretKey) (swk *
 	return
 }
 
+func (keygen *keyGenerator) GenSwitchingKeyExplicit(skInput *SecretKey,pkOutput *PublicKey, swk_tmp *SwitchingKey) (swk *SwitchingKey){
+	// N -> n (swk is to switch to a smaller dimension).
+	swk = swk_tmp
+	if len(skInput.Value.Q.Coeffs[0]) > len(pkOutput.Value[0].Q.Coeffs[0]) {
+
+		levelP := skInput.LevelP()
+
+		// Allocates the switching-key.
+		// swk = NewSwitchingKey(keygen.params, pkOutput.Value[0].Q.Level(), levelP)
+
+		// Maps the smaller key to the largest with Y = X^{N/n}.
+		ring.MapSmallDimensionToLargerDimensionNTT(pkOutput.Value[0].Q, keygen.buffQP.Q)
+
+		// Extends the modulus P of skOutput to the one of skInput
+		if levelP != -1 {
+			keygen.extendQ2P(levelP, keygen.buffQP.Q, keygen.buffQ[0], keygen.buffQP.P)
+		}
+
+		keygen.genSwitchingKeyWithPk(keygen.buffQ[0], pkOutput, swk)
+
+	} else { // N -> N or n -> N (swk switch to the same or a larger dimension)
+		// levelP := utils.MinInt(pkOutput.LevelP(), keygen.params.MaxLevelP())
+
+		// Allocates the switching-key.
+		// swk = NewSwitchingKey(keygen.params, pkOutput.Value[0].Q.Level(), levelP)
+
+		// Maps the smaller key to the largest dimension with Y = X^{N/n}.
+		ring.MapSmallDimensionToLargerDimensionNTT(skInput.Value.Q, keygen.buffQ[0])
+
+		// Extends the modulus of the input key to the one of the output key
+		// if the former is smaller.
+		if skInput.Value.Q.Level() < pkOutput.Value[0].Q.Level() {
+
+			ringQ := keygen.params.RingQ().AtLevel(0)
+
+			// Switches out of the NTT and Montgomery domain.
+			ringQ.INTT(keygen.buffQ[0], keygen.buffQP.Q)
+			ringQ.IMForm(keygen.buffQP.Q, keygen.buffQP.Q)
+
+			// Extends the RNS basis of the small norm polynomial.
+			Qi := ringQ.ModuliChain()
+			Q := Qi[0]
+			QHalf := Q >> 1
+
+			polQ := keygen.buffQP.Q
+			polP := keygen.buffQ[0]
+			var sign uint64
+			N := ringQ.N()
+			for j := 0; j < N; j++ {
+
+				coeff := polQ.Coeffs[0][j]
+
+				sign = 1
+				if coeff > QHalf {
+					coeff = Q - coeff
+					sign = 0
+				}
+
+				for i := skInput.LevelQ() + 1; i < pkOutput.LevelQ()+1; i++ {
+					polP.Coeffs[i][j] = (coeff * sign) | (Qi[i]-coeff)*(sign^1)
+				}
+			}
+
+			// Switches back to the NTT and Montgomery domain.
+			for i := skInput.Value.Q.Level() + 1; i < pkOutput.Value[0].Q.Level()+1; i++ {
+				ringQ.SubRings[i].NTT(polP.Coeffs[i], polP.Coeffs[i])
+				ringQ.SubRings[i].MForm(polP.Coeffs[i], polP.Coeffs[i])
+			}
+		}
+
+		// keygen.genSwitchingKeyWithPk(keygen.buffQ[0], pkOutput, swk, params, logSlots)
+		//keygen.genSwitchingKeyExplicit(keygen.buffQ[0], pkOutput, params, swk, us)
+		keygen.genSwitchingKeyWithPk(keygen.buffQ[0], pkOutput, swk)
+	}
+
+	return
+
+}
+
+
 func (keygen *keyGenerator) extendQ2P(levelP int, polQ, buff, polP *ring.Poly) {
 	ringQ := keygen.params.RingQ().AtLevel(0)
 	ringP := keygen.params.RingP().AtLevel(levelP)
@@ -324,6 +408,28 @@ func (keygen *keyGenerator) genSwitchingKey(skIn *ring.Poly, skOut *SecretKey, s
 			enc.EncryptZero(&swk.Value[i][j])
 		}
 	}
+
+	// Adds the plaintext (input-key) to the switching-key.
+	AddPolyTimesGadgetVectorToGadgetCiphertext(skIn, []GadgetCiphertext{swk.GadgetCiphertext}, *keygen.params.RingQP(), keygen.params.Pow2Base(), keygen.buffQ[0])
+}
+
+func (keygen *keyGenerator) genSwitchingKeyWithPk(skIn *ring.Poly, pkOut *PublicKey, swk *SwitchingKey){
+// func (keygen *keyGenerator) genSwitchingKeyWithPk(skIn *ring.Poly, pkOut *PublicKey, swk *SwitchingKey){
+
+	// fmt.Printf("tmp1\n")
+	// fmt.Printf("%T\n", keygen)
+	// fmt.Printf("%T\n", pkOut)
+	// fmt.Printf("%T\n", params)
+	// enc := NewEncryptor(params, pkOut)
+	//enc := keygen.WithKey(pkOut)
+	// fmt.Printf("tmp2\n")
+	//enc := newPkEncryptor(paramsTmp, pkOut)
+	// Samples an encryption of zero for each element of the switching-key.
+	// for i := 0; i < len(swk.Value); i++ {
+	// 	for j := 0; j < len(swk.Value[0]); j++ {
+	// 		enc.EncryptZeroQP(&swk.Value[i][j], us)
+	// 	}
+	// }
 
 	// Adds the plaintext (input-key) to the switching-key.
 	AddPolyTimesGadgetVectorToGadgetCiphertext(skIn, []GadgetCiphertext{swk.GadgetCiphertext}, *keygen.params.RingQP(), keygen.params.Pow2Base(), keygen.buffQ[0])

@@ -13,6 +13,7 @@ import (
 type Encryptor interface {
 	Encrypt(pt *Plaintext, ct interface{})
 	EncryptZero(ct interface{})
+	EncryptZeroQP(ct *CiphertextQP, uniformSampler ringqp.UniformSampler) 
 
 	EncryptZeroNew(level int) (ct *Ciphertext)
 	EncryptNew(pt *Plaintext) (ct *Ciphertext)
@@ -42,6 +43,7 @@ type encryptorBase struct {
 type pkEncryptor struct {
 	*encryptorBase
 	pk *PublicKey
+	uniformSampler ringqp.UniformSampler
 }
 
 type skEncryptor struct {
@@ -107,8 +109,13 @@ func newSkEncryptor(params Parameters, key interface{}) (enc *skEncryptor) {
 }
 
 func newPkEncryptor(params Parameters, key interface{}) (enc *pkEncryptor) {
+	prng, err_tmp := utils.NewPRNG()
+	if err_tmp != nil {
+		panic(fmt.Errorf("cannot newSkEncryptor: could not create PRNG for symmetric encryptor: %s", err_tmp))
+	}
+
 	var err error
-	enc = &pkEncryptor{newEncryptorBase(params), nil}
+	enc = &pkEncryptor{newEncryptorBase(params), nil, ringqp.NewUniformSampler(prng, *params.RingQP())}
 	enc.pk, err = enc.checkPk(key)
 	if err != nil {
 		panic(err)
@@ -209,6 +216,14 @@ func (enc *pkEncryptor) EncryptZero(ct interface{}) {
 	default:
 		panic(fmt.Sprintf("cannot Encrypt: input ciphertext type %s is not supported", reflect.TypeOf(ct)))
 	}
+}
+
+func (enc *skEncryptor) EncryptZeroQP(ct *CiphertextQP, uniformSampler ringqp.UniformSampler) {
+	enc.encryptZeroQP(*ct)
+}
+
+func (enc *pkEncryptor) EncryptZeroQP(ct *CiphertextQP, uniformSampler ringqp.UniformSampler) {
+	enc.encryptZeroQP(*ct, uniformSampler)
 }
 
 func (enc *pkEncryptor) encryptZero(ct *Ciphertext) {
@@ -428,6 +443,90 @@ func (enc *skEncryptor) encryptZeroQP(ct CiphertextQP) {
 		ringQP.INTT(c1, c1)
 	}
 }
+func (enc *pkEncryptor) encryptZeroQP(ct CiphertextQP, uniformSampler ringqp.UniformSampler) {
+
+	c0, c1 := ct.Value[0], ct.Value[1]
+
+	levelQ, levelP := c0.LevelQ(), c1.LevelP()
+	ringQP := enc.params.RingQP().AtLevel(levelQ, levelP)
+
+	buffQ0 := enc.buffQ[0]
+	// buffP0 := enc.buffP[0]
+	// buffP1 := enc.buffP[1]
+	buffP2 := enc.buffP[2]
+
+	u := ringqp.Poly{Q: buffQ0, P: buffP2}
+
+	// We sample a RLWE instance (encryption of zero) over the extended ring (ciphertext ring + special prime)
+	enc.ternarySampler.AtLevel(levelQ).Read(u.Q)
+	ringQP.ExtendBasisSmallNormAndCenter(u.Q, levelP, nil, u.P)
+
+	// (#Q + #P) NTT
+	ringQP.NTT(u, u)
+
+	ct0QP := ct.Value[0]
+	ct1QP := ct.Value[1]
+
+	// ct0 = u*pk0
+	// ct1 = u*pk1
+	ringQP.MulCoeffsMontgomery(u, enc.pk.Value[0], ct0QP)
+	ringQP.MulCoeffsMontgomery(u, enc.pk.Value[1], ct1QP)
+
+	// 2*(#Q + #P) NTT
+	ringQP.INTT(ct0QP, ct0QP)
+	ringQP.INTT(ct1QP, ct1QP)
+
+	e := ringqp.Poly{Q: buffQ0, P: buffP2}
+
+	enc.gaussianSampler.AtLevel(levelQ).Read(e.Q)
+	ringQP.ExtendBasisSmallNormAndCenter(e.Q, levelP, nil, e.P)
+	ringQP.Add(ct0QP, e, ct0QP)
+
+	enc.gaussianSampler.AtLevel(levelQ).Read(e.Q)
+	ringQP.ExtendBasisSmallNormAndCenter(e.Q, levelP, nil, e.P)
+	ringQP.Add(ct1QP, e, ct1QP)
+
+	// // ct0 = (u*pk0 + e0)/P
+	// enc.basisextender.ModDownQPtoQ(levelQ, levelP, ct0QP.Q, ct0QP.P, ct.Value[0])
+
+	// // ct1 = (u*pk1 + e1)/P
+	// enc.basisextender.ModDownQPtoQ(levelQ, levelP, ct1QP.Q, ct1QP.P, ct.Value[1])
+
+	// if ct.IsNTT {
+	// 	ringQP.RingQ.NTT(ct.Value[0], ct.Value[0])
+	// 	ringQP.RingQ.NTT(ct.Value[1], ct.Value[1])
+	// }
+
+	/*
+	c0, c1 := ct.Value[0], ct.Value[1]
+
+	levelQ, levelP := c0.LevelQ(), c1.LevelP()
+	ringQP := enc.params.RingQP().AtLevel(levelQ, levelP)
+
+	// ct = (e, 0)
+	enc.gaussianSampler.AtLevel(levelQ).Read(c0.Q)
+	if levelP != -1 {
+		ringQP.ExtendBasisSmallNormAndCenter(c0.Q, levelP, nil, c0.P)
+	}
+
+	ringQP.NTT(c0, c0)
+	// ct[1] is assumed to be sampled in of the Montgomery domain,
+	// thus -as will also be in the Montgomery domain (s is by default), therefore 'e'
+	// must be switched to the Montgomery domain.
+	ringQP.MForm(c0, c0)
+
+	// ct = (e, a)
+	uniformSampler.AtLevel(levelQ, levelP).Read(c1)
+
+	// (-a*sk + e, a)
+	ringQP.MulCoeffsMontgomeryThenSub(c1, enc.pk.Value[0], c0)
+
+	if !ct.IsNTT {
+		ringQP.INTT(c0, c0)
+		ringQP.INTT(c1, c1)
+	}
+	*/
+}
 
 // ShallowCopy creates a shallow copy of this skEncryptor in which all the read-only data-structures are
 // shared with the receiver and the temporary buffers are reallocated. The receiver and the returned
@@ -454,11 +553,17 @@ func (enc *skEncryptor) WithKey(key interface{}) Encryptor {
 
 // WithKey returns this encryptor with a new key.
 func (enc *pkEncryptor) WithKey(key interface{}) Encryptor {
+	prng, err_tmp := utils.NewPRNG()
+	if err_tmp != nil {
+		panic(fmt.Errorf("cannot newSkEncryptor: could not create PRNG for symmetric encryptor: %s", err_tmp))
+	}
+
+	var err error
 	pkPtr, err := enc.checkPk(key)
 	if err != nil {
 		panic(err)
 	}
-	return &pkEncryptor{enc.encryptorBase, pkPtr}
+	return &pkEncryptor{enc.encryptorBase, pkPtr, ringqp.NewUniformSampler(prng, *enc.encryptorBase.params.RingQP())}
 }
 
 // WithPRNG returns this encryptor with prng as its source of randomness for the uniform
